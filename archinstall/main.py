@@ -113,6 +113,9 @@ def run() -> int:
 	OR straight as a module: python -m archinstall
 	In any case we will be attempting to load the provided script to be run from the scripts/ folder
 	"""
+	print('Entropy Linux Installer ~ (fork of archinstall)')
+	time.sleep(3)
+
 	arch_config_handler = ArchConfigHandler()
 
 	if '--help' in sys.argv or '-h' in sys.argv:
@@ -133,7 +136,7 @@ def run() -> int:
 		return 0
 
 	if os.getuid() != 0:
-		print(tr('Archinstall requires root privileges to run. See --help for more.'))
+		print(tr('Szmelcinstall requires root privileges to run. See --help for more.'))
 		return 1
 
 	translation_handler.save_console_font()
