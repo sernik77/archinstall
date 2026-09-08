@@ -28,6 +28,7 @@ from archinstall.lib.disk.utils import (
 	mount,
 	swapon,
 )
+from archinstall.lib.error_recovery import report_dropped
 from archinstall.lib.exceptions import DiskError, HardwareIncompatibilityError, RequirementError, ServiceException, SysCallError
 from archinstall.lib.hardware import SysInfo
 from archinstall.lib.linux_path import LPath
@@ -159,6 +160,8 @@ class Installer:
 
 		info(tr('Syncing the system...'))
 		os.sync()
+
+		report_dropped(self.pacman.dropped_packages)
 
 		if not (missing_steps := self.post_install_check()):
 			msg = f'Installation completed without any errors.\nLog files temporarily available at {logger.directory}.\nYou may reboot when ready.\n'

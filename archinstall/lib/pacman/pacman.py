@@ -1,15 +1,26 @@
-import re
+import shlex
 import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
 
 from archinstall.lib.command import SysCommand
+from archinstall.lib.error_recovery import RETRY, Recovery, package, prompt
 from archinstall.lib.exceptions import RequirementError, SysCallError
 from archinstall.lib.log import debug, error, info, warn
+from archinstall.lib.pacman.errors import Failure, FailureKind, classify, strip_version
 from archinstall.lib.pathnames import PACMAN_CONF
 from archinstall.lib.plugins import plugins
 from archinstall.lib.translationhandler import tr
+from archinstall.lib.utils.encoding import clear_vt100_escape_codes_from_str
+
+_HEADERS = {
+	FailureKind.CONFLICT: 'Package conflict',
+	FailureKind.FILE_EXISTS: 'Conflicting files on the target',
+	FailureKind.MISSING_TARGET: 'Package not found',
+	FailureKind.UNSATISFIED_DEPENDENCY: 'Unsatisfied dependency',
+	FailureKind.UNKNOWN: 'Package installation failed',
+}
 
 
 class Pacman:
@@ -17,12 +28,22 @@ class Pacman:
 		self.synced = False
 		self.silent = silent
 		self.target = target
+		self.dropped_packages: list[str] = []
+		"""Packages skipped while recovering from a failure, reported once the installation ends."""
 
 	@staticmethod
 	def run(args: str, default_cmd: str = 'pacman') -> SysCommand:
 		"""
 		A centralized function to call `pacman` from.
-		It also protects us from colliding with other running pacman sessions (if used locally).
+		"""
+		Pacman.wait_for_db_lock()
+
+		return SysCommand(f'{default_cmd} {args}')
+
+	@staticmethod
+	def wait_for_db_lock() -> None:
+		"""
+		Protect us from colliding with other running pacman sessions (if used locally).
 		The grace period is set to 10 minutes before exiting hard if another pacman instance is running.
 		"""
 		pacman_db_lock = Path('/var/lib/pacman/db.lck')
@@ -37,8 +58,6 @@ class Pacman:
 			if time.monotonic() - started > (60 * 10):
 				error(tr('Pre-existing pacman lock never exited. Please clean up any existing pacman sessions before using archinstall.'))
 				sys.exit(1)
-
-		return SysCommand(f'{default_cmd} {args}')
 
 	def ask(self, error_message: str, bail_message: str, func: Callable, *args, **kwargs) -> None:  # type: ignore[no-untyped-def, type-arg]
 		while True:
@@ -95,6 +114,7 @@ class Pacman:
 
 	def strap(self, packages: str | list[str]) -> None:
 		self.sync()
+
 		if isinstance(packages, str):
 			packages = [packages]
 
@@ -105,255 +125,195 @@ class Pacman:
 
 		packages = list(dict.fromkeys(packages))  # preserve order, remove dups
 
-		while True:
+		if not packages:
+			return
+
+		overwrite: list[str] = []
+		seen: set[str] = set()
+
+		while packages:
+			self.wait_for_db_lock()
 			info(f'Installing packages: {packages}')
 
+			command = f'pacstrap -C {PACMAN_CONF} -K {self.target} {" ".join(packages)} --noconfirm --needed'
+			command += ''.join(f' --overwrite {shlex.quote(path)}' for path in overwrite)
+
 			try:
-				SysCommand(
-					f'pacstrap -C {PACMAN_CONF} -K {self.target} {" ".join(packages)} --noconfirm --needed',
-					peek_output=True,
-				)
+				SysCommand(command, peek_output=True)
 				return
 			except SysCallError as err:
-				action = self._handle_pacstrap_conflict(err, packages)
-
-				if action == 'retry':
-					continue
-				elif action in ('skip', 'force'):
-					return
-
-				action = self._handle_pacstrap_missing(err, packages)
-
-				if action == 'retry':
-					continue
-				elif action in ('skip', 'force'):
-					return
-
-				# fallback to legacy yes/no retry for other errors
 				error('Could not strap in packages')
-				if not self.silent and input('Would you like to re-try this download? (Y/n): ').lower().strip() in 'y':
-					continue
 
-				raise RequirementError(
-					'Pacstrap failed. See /var/log/archinstall/install.log or above message for error details',
-				) from err
+				if not self._recover(err, packages, overwrite, seen):
+					raise RequirementError(
+						'Pacstrap failed. See /var/log/archinstall/install.log or above message for error details',
+					) from err
 
-	def _handle_pacstrap_conflict(self, err: SysCallError, packages: list[str]) -> str | None:
+		# Everything that was asked for got skipped along the way; the summary at
+		# the end of the installation lists what is missing.
+		warn('Continuing without the remaining packages')
+
+	def _recover(
+		self,
+		err: SysCallError,
+		packages: list[str],
+		overwrite: list[str],
+		seen: set[str],
+	) -> bool:
 		"""
-		Handle package conflicts interactively.
-		Returns:
-			'retry' to attempt pacstrap again,
-			'skip' to skip this package set,
-			'force' to ignore the error and continue,
-			None to fall back to legacy handling.
+		Halt and ask the user how to deal with a failed pacstrap run.
+
+		`packages` and `overwrite` are updated in place. Returns True when
+		something actually changed and retrying makes sense, and False when the
+		caller should give up so that the original error is raised.
 		"""
-		conflict = self._parse_conflict(str(err))
+		failure = classify(_error_output(err))
 
-		if conflict is None:
-			return None
+		# The same failure twice in a row means whatever we offered last time did
+		# not help, so stop offering it.
+		signature = f'{failure.kind}:{",".join(failure.candidates)}'
+		repeated = signature in seen
+		seen.add(signature)
 
-		pkg_a, pkg_b, remove_candidate = conflict
+		droppable = [name for name in failure.candidates if _requested(packages, name)]
+		options, safe = _recovery_options(failure, droppable, repeated)
 
-		if self.silent:
-			return None
+		detail = failure.summary
 
-		choices = [
-			('remove', f'Remove {remove_candidate} and retry'),
-			('choose_a', f'Choose {pkg_a}'),
-			('choose_b', f'Choose {pkg_b}'),
-			('force', 'Force and continue'),
-			('skip', 'Skip this step and continue'),
-		]
+		if not options:
+			detail += _explain_no_options(failure, droppable)
 
-		print('\nPackage conflict detected:')
-		print(f'  {pkg_a} <-> {pkg_b}')
+		choice = prompt(
+			_HEADERS[failure.kind],
+			options,
+			safe=safe,
+			detail=detail,
+			hint=f'The target root is mounted at {self.target}; use "arch-chroot {self.target}" to work inside it.',
+			interactive=not self.silent,
+		)
 
-		for idx, (_, label) in enumerate(choices, 1):
-			print(f'  {idx}) {label}')
+		if choice == RETRY:
+			return True
 
-		selection = None
-		while selection is None:
-			try:
-				val = input('Select an option (1-5): ').strip()
-				idx = int(val) if val else 0
-				if 1 <= idx <= len(choices):
-					selection = choices[idx - 1][0]
-				else:
-					print('Invalid selection, try again.')
-			except ValueError:
-				print('Invalid selection, try again.')
+		if choice == 'overwrite':
+			overwrite.extend(failure.paths)
+			return True
 
-		match selection:
-			case 'remove':
-				new_packages = [p for p in packages if self._strip_pkg_version(p) != self._strip_pkg_version(remove_candidate)]
-				desc = f'Remove {remove_candidate} and retry'
-				if not self._confirm_choice(selection, desc):
-					return None
-				packages[:] = new_packages
-				info(f'Retrying without {remove_candidate}')
-				return 'retry'
-			case 'choose_a':
-				base_a = self._strip_pkg_version(pkg_a)
-				base_b = self._strip_pkg_version(pkg_b)
-				new_packages = [p for p in packages if self._strip_pkg_version(p) != base_b]
-				if all(self._strip_pkg_version(p) != base_a for p in new_packages):
-					new_packages.append(base_a)
-				desc = f'Choose {base_a} and drop {base_b}'
-				if not self._confirm_choice(selection, desc):
-					return None
-				packages[:] = new_packages
-				info(f'Retrying with {base_a}, dropping {base_b}')
-				return 'retry'
-			case 'choose_b':
-				base_a = self._strip_pkg_version(pkg_a)
-				base_b = self._strip_pkg_version(pkg_b)
-				new_packages = [p for p in packages if self._strip_pkg_version(p) != base_a]
-				if all(self._strip_pkg_version(p) != base_b for p in new_packages):
-					new_packages.append(base_b)
-				desc = f'Choose {base_b} and drop {base_a}'
-				if not self._confirm_choice(selection, desc):
-					return None
-				packages[:] = new_packages
-				info(f'Retrying with {base_b}, dropping {base_a}')
-				return 'retry'
-			case 'force':
-				desc = 'Force past the conflict (may leave packages missing)'
-				if not self._confirm_choice(selection, desc):
-					return None
-				warn('Forcing past pacstrap error; packages may be missing or unresolved.')
-				return 'force'
-			case 'skip':
-				desc = 'Skip this package set and continue installation'
-				if not self._confirm_choice(selection, desc):
-					return None
-				warn('Skipping this package set and continuing installation.')
-				packages.clear()
-				return 'skip'
+		before = list(packages)
 
-		return None
+		# Every branch below is only ever offered when the packages it names are in
+		# `droppable`, so indexing into it is safe.
+		match choice:
+			case 'keep_first':
+				self._drop(packages, droppable[1])
+			case 'keep_second':
+				self._drop(packages, droppable[0])
+			case 'drop':
+				self._drop(packages, *droppable)
+			case 'rename':
+				self._rename(packages, droppable[0])
+			case 'abandon':
+				self._drop(packages, *list(packages))
 
-	def _parse_conflict(self, output: str) -> tuple[str, str, str] | None:
-		"""
-		Extract conflicting packages from pacman output.
-		Returns (pkg_a, pkg_b, remove_candidate)
-		"""
-		pkg_a = pkg_b = remove_candidate = None
+		if packages == before:
+			warn('Nothing changed, so retrying would fail the same way')
+			return False
 
-		for line in output.splitlines():
-			if 'are in conflict' in line:
-				if m := re.search(r'::\s*([^\s]+)\s+and\s+([^\s]+)\s+are in conflict', line):
-					pkg_a, pkg_b = m.group(1), m.group(2)
-			if 'Remove ' in line and '?' in line:
-				if m := re.search(r'Remove\s+([^\s?]+)\?', line):
-					remove_candidate = m.group(1)
+		return True
 
-		if pkg_a and pkg_b:
-			return pkg_a, pkg_b, remove_candidate or pkg_b
+	def _drop(self, packages: list[str], *names: str) -> None:
+		targets = {strip_version(name) for name in names}
+		kept = []
 
-		return None
+		for entry in packages:
+			if strip_version(entry) in targets:
+				warn(f'Skipping {entry}')
+				self.dropped_packages.append(entry)
+			else:
+				kept.append(entry)
 
-	def _handle_pacstrap_missing(self, err: SysCallError, packages: list[str]) -> str | None:
-		"""
-		Handle "target not found" errors with interactive remediation.
-		Returns:
-			'retry', 'skip', 'force', or None to fall back.
-		"""
-		missing_pkg = None
-		for line in str(err).splitlines():
-			if 'target not found' in line:
-				if m := re.search(r'target not found:\s*([^\s]+)', line):
-					missing_pkg = m.group(1)
-					break
+		packages[:] = kept
 
-		if missing_pkg is None or self.silent:
-			return None
+	def _rename(self, packages: list[str], name: str) -> None:
+		try:
+			replacement = input(f'Enter the package name to use instead of {name}: ').strip()
+		except EOFError:
+			replacement = ''
 
-		base_missing = self._strip_pkg_version(missing_pkg)
+		if not replacement:
+			return
 
-		options = [
-			('skip', f'Skip package {missing_pkg} and continue'),
-			('manual', f'Correct package name manually (current: {missing_pkg})'),
-			('strip_version', f'Ignore version and retry with {base_missing}'),
-			('stop', 'Stop and exit'),
-		]
+		target = strip_version(name)
+		packages[:] = [replacement if strip_version(entry) == target else entry for entry in packages]
+		info(f'Replaced {name} with {replacement}')
 
-		print(f'\nPackage {missing_pkg} not found.')
-		for idx, (_, label) in enumerate(options, 1):
-			print(f'  {idx}) {label}')
 
-		selection = None
-		while selection is None:
-			try:
-				val = input('Select an option (1-4): ').strip()
-				idx = int(val) if val else 0
-				if 1 <= idx <= len(options):
-					selection = options[idx - 1][0]
-				else:
-					print('Invalid selection, try again.')
-			except ValueError:
-				print('Invalid selection, try again.')
+def _recovery_options(failure: Failure, droppable: list[str], repeated: bool) -> tuple[list[Recovery], str | None]:
+	"""
+	Build the choices that make sense for a failure.
 
-		if selection == 'skip':
-			desc = f'Skip {missing_pkg} and retry without it'
-			if not self._confirm_choice(selection, desc):
-				return None
-			packages[:] = [p for p in packages if self._strip_pkg_version(p) != base_missing]
-			info(f'Skipping {missing_pkg}')
-			return 'retry'
+	The second element names the choice to fall back on when nobody answers in
+	time. It is None whenever no option can be taken safely without a human, in
+	which case the prompt waits instead of guessing.
+	"""
+	if repeated:
+		return [Recovery('abandon', 'Skip the remaining packages and continue the installation')], None
 
-		if selection == 'manual':
-			new_name = input('Enter corrected package name: ').strip()
-			if not new_name:
-				return None
-			desc = f'Use {new_name} instead of {missing_pkg}'
-			if not self._confirm_choice(selection, desc):
-				return None
-			new_packages = []
-			replaced = False
-			for p in packages:
-				if self._strip_pkg_version(p) == base_missing and not replaced:
-					new_packages.append(new_name)
-					replaced = True
-				else:
-					new_packages.append(p)
-			if not replaced:
-				new_packages.append(new_name)
-			packages[:] = new_packages
-			info(f'Retrying with corrected package {new_name}')
-			return 'retry'
+	first, *rest = failure.candidates or ('',)
+	second = rest[0] if rest else ''
 
-		if selection == 'strip_version':
-			desc = f'Retry with {base_missing} (version stripped)'
-			if not self._confirm_choice(selection, desc):
-				return None
-			new_packages = []
-			for p in packages:
-				if self._strip_pkg_version(p) == base_missing:
-					if base_missing not in new_packages:
-						new_packages.append(base_missing)
-				else:
-					new_packages.append(p)
-			packages[:] = new_packages
-			info(f'Retrying with {base_missing}')
-			return 'retry'
+	match failure.kind:
+		case FailureKind.CONFLICT if len(droppable) == 2:
+			return [
+				Recovery('keep_first', f'Keep {package(first)} and drop {package(second)}'),
+				Recovery('keep_second', f'Keep {package(second)} and drop {package(first)}'),
+				Recovery('drop', f'Keep neither {package(first)} nor {package(second)} and continue'),
+			], 'drop'
+		case FailureKind.CONFLICT | FailureKind.MISSING_TARGET | FailureKind.UNSATISFIED_DEPENDENCY if droppable:
+			options = [Recovery('drop', f'Drop {package(droppable[0])} and continue')]
 
-		if selection == 'stop':
-			desc = 'Stop installation'
-			if not self._confirm_choice(selection, desc):
-				return None
-			raise RequirementError(f'Package {missing_pkg} not found; installation stopped.')
+			if failure.kind == FailureKind.MISSING_TARGET:
+				options.insert(0, Recovery('rename', f'Replace {package(first)} with another package name'))
 
-		return None
+			return options, 'drop'
+		case FailureKind.FILE_EXISTS:
+			options = [Recovery('overwrite', 'Overwrite the conflicting files and retry')]
 
-	def _strip_pkg_version(self, name: str) -> str:
-		base = re.split(r'[<>=]', name)[0]
-		if ':' in base:
-			epoch, rest = base.split(':', 1)
-			if rest and rest[0].isdigit():
-				base = epoch
-		base = re.sub(r'-\d[\w\.:+~-]*$', '', base)
-		return base
+			if droppable:
+				options.append(Recovery('drop', f'Drop {package(droppable[0])} and continue'))
 
-	def _confirm_choice(self, choice_key: str, actions: str) -> bool:
-		resp = input(f'Chosen: {choice_key}. {actions}. Continue? (Y/n): ').strip().lower()
-		return resp in ('', 'y', 'yes')
+			return options, 'drop' if droppable else None
+		case FailureKind.UNKNOWN:
+			return [
+				Recovery(RETRY, 'Retry installing these packages'),
+				Recovery('abandon', 'Skip these packages and continue the installation'),
+			], RETRY
+		case _:
+			return [], None
+
+
+def _explain_no_options(failure: Failure, droppable: list[str]) -> str:
+	if failure.candidates and not droppable:
+		names = ', '.join(failure.candidates)
+		return f'\n{names} was pulled in as a dependency, so it cannot be removed from the requested package list.'
+
+	return ''
+
+
+def _requested(packages: list[str], name: str) -> bool:
+	"""Whether a package was asked for directly, as opposed to being pulled in as a dependency."""
+	target = strip_version(name)
+	return any(strip_version(entry) == target for entry in packages)
+
+
+def _error_output(err: SysCallError) -> str:
+	"""
+	The command output to classify.
+
+	`str(err)` is truncated to the last 500 characters, which routinely cuts off
+	the line naming the conflict, so prefer the full worker log.
+	"""
+	if err.worker_log:
+		return clear_vt100_escape_codes_from_str(err.worker_log.decode('utf-8', errors='replace'))
+
+	return str(err)
