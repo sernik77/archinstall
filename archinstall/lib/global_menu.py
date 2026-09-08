@@ -8,6 +8,7 @@ from archinstall.lib.bootloader.bootloader_menu import BootloaderMenu
 from archinstall.lib.bootloader.utils import validate_bootloader_layout
 from archinstall.lib.configuration import save_config
 from archinstall.lib.disk.disk_menu import DiskLayoutConfigurationMenu
+from archinstall.lib.entropy.tweaks import ArchTweaksMenu, EntropyTweaksMenu
 from archinstall.lib.general.general_menu import select_hostname, select_ntp, select_timezone
 from archinstall.lib.general.system_menu import select_kernel, select_swap
 from archinstall.lib.hardware import SysInfo
@@ -62,6 +63,18 @@ class GlobalMenu(AbstractMenu[None]):
 
 	def _get_menu_options(self) -> list[MenuItem]:
 		menu_options = [
+			MenuItem(
+				text=tr('Entropy Tweaks'),
+				action=self._entropy_tweaks,
+				preview_action=self._prev_entropy_tweaks,
+				key='entropy_tweaks',
+			),
+			MenuItem(
+				text=tr('Arch Tweaks'),
+				action=self._arch_tweaks,
+				preview_action=self._prev_arch_tweaks,
+				key='arch_tweaks',
+			),
 			MenuItem(
 				text=tr('Archinstall language'),
 				action=self._select_archinstall_language,
@@ -311,6 +324,40 @@ class GlobalMenu(AbstractMenu[None]):
 			output = '\n'.join(sorted(item.value))
 			return output
 		return None
+
+	def _prev_entropy_tweaks(self, item: MenuItem) -> str | None:
+		flags = []
+		if self._arch_config.install_from_iso:
+			mode = self._arch_config.install_from_iso_mode
+			label = tr('Configs + Live Cache') if mode == 'configs_cache' else tr('Configs')
+			flags.append(f'{tr("Install from ISO")}: {label}')
+		if self._arch_config.custom_script:
+			flags.append(tr('Custom script'))
+		if self._arch_config.szmelc_aur:
+			flags.append('Szmelc AUR')
+		if self._arch_config.entropy_kits:
+			flags.append(tr('Kits: {}').format(len(self._arch_config.entropy_kits)))
+		if self._arch_config.entropy_szmelc_packages:
+			flags.append(tr('Szmelc packages: {}').format(len(self._arch_config.entropy_szmelc_packages)))
+		if self._arch_config.entropy_config_packs:
+			flags.append(tr('Configs: {}').format(len(self._arch_config.entropy_config_packs)))
+		if self._arch_config.entropy_asset_packs:
+			flags.append(tr('Assets: {}').format(len(self._arch_config.entropy_asset_packs)))
+		return ', '.join(flags) if flags else tr('No tweaks enabled')
+
+	def _prev_arch_tweaks(self, item: MenuItem) -> str | None:
+		flags = []
+		if self._arch_config.install_yay:
+			flags.append(tr('Install yay'))
+		if self._arch_config.chaotic_aur:
+			flags.append('Chaotic AUR')
+		return ', '.join(flags) if flags else tr('No tweaks enabled')
+
+	async def _entropy_tweaks(self, preset: None = None) -> None:
+		await EntropyTweaksMenu(self._arch_config).show()
+
+	async def _arch_tweaks(self, preset: None = None) -> None:
+		await ArchTweaksMenu(self._arch_config).show()
 
 	def _prev_authentication(self, item: MenuItem) -> str | None:
 		if item.value:

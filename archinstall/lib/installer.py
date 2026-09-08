@@ -1,7 +1,10 @@
+import fnmatch
+import json
 import os
 import platform
 import re
 import shlex
+import shutil
 import subprocess
 import textwrap
 import time
@@ -59,6 +62,7 @@ from archinstall.lib.pacman.pacman import Pacman
 from archinstall.lib.pathnames import MIRRORLIST, PACMAN_CONF
 from archinstall.lib.plugins import plugins
 from archinstall.lib.translationhandler import tr
+from archinstall.lib.utils.encoding import clear_vt100_escape_codes_from_str
 
 # Any package that the Installer() is responsible for (optional and the default ones)
 # https://github.com/archlinux/archinstall/issues/4368
@@ -132,6 +136,8 @@ class Installer:
 		self._zram_enabled = False
 		self._disable_fstrim = False
 
+		self._silent = silent
+		self._install_from_iso_config_cache: dict[str, dict[str, Any]] = {}
 		self.pacman = Pacman(self.target, silent)
 
 	def __enter__(self) -> Self:
@@ -590,7 +596,11 @@ class Installer:
 			mirrorlist_config = MIRRORLIST
 			pacman_config = PACMAN_CONF
 
-		repositories_config = mirror_config.repositories_config()
+		existing_pacman_config = ''
+		if pacman_config.exists():
+			existing_pacman_config = pacman_config.read_text()
+
+		repositories_config = mirror_config.repositories_config(existing_pacman_config)
 		if repositories_config:
 			debug(f'Pacman config: {repositories_config}')
 
@@ -838,6 +848,597 @@ class Installer:
 					self.enable_service(['systemd-networkd', 'systemd-resolved'])
 
 		return True
+
+	def _primary_user(self, users: list[User]) -> User | None:
+		if not users:
+			return None
+
+		for user in users:
+			if user.sudo:
+				return user
+
+		return users[0]
+
+	def _resolve_live_user_home(self) -> Path | None:
+		home_parent = Path('/home')
+		preferred_users = ['entropy', 'liveuser', 'arch']
+		env_user = os.environ.get('SUDO_USER') or os.environ.get('USER') or os.environ.get('LOGNAME')
+
+		for name in preferred_users:
+			candidate = home_parent / name
+			if candidate.exists():
+				return candidate
+
+		if env_user and env_user != 'root':
+			candidate = home_parent / env_user
+			if candidate.exists():
+				return candidate
+
+		if home_parent.exists():
+			for entry in home_parent.iterdir():
+				if entry.is_dir():
+					return entry
+
+		home_dir = Path.home()
+		return home_dir if home_dir.exists() else None
+
+	def _should_exclude(self, rel_path: str, abs_path: Path, exclude_patterns: list[str]) -> bool:
+		for pattern in exclude_patterns:
+			if pattern.startswith('/'):
+				base_pat = pattern[:-3] if pattern.endswith('/**') else pattern
+				if fnmatch.fnmatch(str(abs_path), pattern) or str(abs_path).startswith(base_pat.rstrip('/') + '/'):
+					return True
+				continue
+
+			pat = pattern.lstrip('/')
+			if pat.endswith('/**'):
+				base_pat = pat[:-3]
+				if rel_path == base_pat or rel_path.startswith(base_pat.rstrip('/') + '/'):
+					return True
+			if fnmatch.fnmatch(rel_path, pat):
+				return True
+
+		return False
+
+	def _gather_home_paths(self, source: Path, include_patterns: list[str]) -> list[Path]:
+		paths: set[Path] = set()
+
+		for pattern in include_patterns:
+			if pattern.startswith('/'):
+				abs_path = Path(pattern)
+				if abs_path.exists() and abs_path.is_relative_to(source):
+					paths.add(abs_path)
+				continue
+
+			pat = pattern.lstrip('./')
+			for match in source.glob(pat):
+				try:
+					match.relative_to(source)
+				except ValueError:
+					continue
+				paths.add(match)
+
+		sorted_paths = sorted(paths, key=lambda p: (len(p.as_posix().split('/')), p.as_posix()))
+
+		minimized: list[Path] = []
+		for path in sorted_paths:
+			if any(parent in path.parents for parent in minimized):
+				continue
+			minimized.append(path)
+
+		return minimized
+
+	def _copy_home_contents(
+		self,
+		source: Path,
+		destination: Path,
+		description: str,
+		include: list[str] | None = None,
+		exclude: list[str] | None = None,
+	) -> None:
+		if not source.exists():
+			debug(f'{description}: source path {source} not found, skipping')
+			return
+
+		include_patterns = include or ['*']
+		exclude_patterns = exclude or []
+
+		info(f'{description}: copying from {source} to {destination}')
+		destination.mkdir(parents=True, exist_ok=True)
+
+		def ignore_func(base: Path) -> Callable[[str, list[str]], list[str]]:
+			def _ignore(dir_path: str, names: list[str]) -> list[str]:
+				ignored: list[str] = []
+				for name in names:
+					full = Path(dir_path) / name
+					try:
+						rel = full.relative_to(base).as_posix()
+					except ValueError:
+						continue
+					if self._should_exclude(rel, full, exclude_patterns):
+						ignored.append(name)
+				return ignored
+
+			return _ignore
+
+		for match in self._gather_home_paths(source, include_patterns):
+			try:
+				rel = match.relative_to(source).as_posix()
+			except ValueError:
+				continue
+
+			if self._should_exclude(rel, match, exclude_patterns):
+				debug(f'{description}: skipping {match} (excluded)')
+				continue
+
+			target = destination / rel
+			try:
+				if match.is_dir() and not match.is_symlink():
+					shutil.copytree(match, target, symlinks=True, dirs_exist_ok=True, ignore=ignore_func(source))
+				else:
+					target.parent.mkdir(parents=True, exist_ok=True)
+					if target.exists() and target.is_dir() and not target.is_symlink():
+						shutil.rmtree(target)
+					shutil.copy2(match, target, follow_symlinks=False)
+			except Exception as err:
+				warn(f'Unable to copy {match} to {target}: {err}')
+
+	def copy_root_home(self, include: list[str] | None = None, exclude: list[str] | None = None) -> None:
+		self._copy_home_contents(Path('/root'), self.target / 'root', 'Syncing root home', include, exclude)
+
+	def copy_live_user_home(self, users: list[User], include: list[str] | None = None, exclude: list[str] | None = None) -> None:
+		if not users:
+			debug('No users configured, skipping live user home sync')
+			return
+
+		primary_user = self._primary_user(users)
+		if primary_user is None:
+			return
+
+		source_home = self._resolve_live_user_home()
+		if source_home is None:
+			debug('No live user home detected, skipping copy to target user')
+			return
+
+		target_home = self.target / 'home' / primary_user.username
+		self._copy_home_contents(source_home, target_home, f'Copying live home to /home/{primary_user.username}', include, exclude)
+
+		try:
+			self.arch_chroot(f'chown -R {primary_user.username}:{primary_user.username} /home/{primary_user.username}')
+		except SysCallError as err:
+			warn(f'Failed to update ownership for /home/{primary_user.username}: {err}')
+
+	def add_live_iso_packages(self) -> list[str]:
+		try:
+			package_lines = Pacman.run('-Qq').decode(strip=False).splitlines()
+		except SysCallError as err:
+			warn(f'Unable to list packages from the live system: {err}')
+			return []
+
+		valid_pattern = re.compile(r'[A-Za-z0-9][A-Za-z0-9@._+-]*$')
+		packages: set[str] = set()
+		invalid: list[str] = []
+
+		for raw_line in package_lines:
+			cleaned = clear_vt100_escape_codes_from_str(raw_line).strip()
+			if not cleaned:
+				continue
+
+			if not valid_pattern.fullmatch(cleaned):
+				invalid.append(cleaned)
+				continue
+
+			packages.add(cleaned)
+
+		if invalid:
+			debug(f'Skipping {len(invalid)} invalid package names from live ISO: {invalid[:5]}')
+
+		# Avoid known conflicts with pipewire-jack that the desktop profile installs later.
+		conflict_packages = {'jack', 'jack2'}
+		conflicts_found = packages.intersection(conflict_packages)
+		if conflicts_found:
+			packages.difference_update(conflict_packages)
+			debug(f'Removed conflicting packages from live ISO set: {sorted(conflicts_found)}')
+
+		if not packages:
+			debug('No packages discovered in live ISO environment')
+			return []
+
+		sorted_packages = sorted(packages)
+		info(f'Adding {len(sorted_packages)} packages from the live ISO to the installation queue')
+		self.add_additional_packages(sorted_packages)
+
+		return sorted_packages
+
+	def apply_install_from_iso(self, users: list[User], mode: str = 'configs') -> None:
+		mode = mode or 'configs'
+		cfg = self._load_install_from_iso_config(mode)
+		root_cfg = cfg.get('root_home', {})
+		user_cfg = cfg.get('user_home', {})
+
+		# Install packages from the live ISO first to avoid file conflicts with /etc/skel.
+		self.add_live_iso_packages()
+
+		self._copy_extra_paths(cfg.get('extra_paths', []))
+
+		self.copy_root_home(
+			include=root_cfg.get('include', ['*']),
+			exclude=root_cfg.get('exclude', []),
+		)
+		self.copy_live_user_home(
+			users,
+			include=user_cfg.get('include', ['*']),
+			exclude=user_cfg.get('exclude', []),
+		)
+		self._populate_users_from_skel(users)
+
+	def _copy_extra_paths(self, entries: list[dict[str, str]]) -> None:
+		for entry in entries:
+			raw_source = entry.get('source', '')
+			destination = entry.get('destination', '')
+
+			if not raw_source or not destination:
+				continue
+
+			source = Path(raw_source)
+
+			if not source.exists():
+				debug(f'Extra path {source} missing, skipping')
+				continue
+
+			dest_path = Path(destination)
+			if dest_path.is_absolute():
+				dest_path = self.target / dest_path.relative_to('/')
+			else:
+				dest_path = self.target / dest_path
+
+			info(f'Copying extra path {source} to {dest_path}')
+			try:
+				if source.is_dir() and not source.is_symlink():
+					shutil.copytree(source, dest_path, symlinks=True, dirs_exist_ok=True)
+				else:
+					dest_path.parent.mkdir(parents=True, exist_ok=True)
+					shutil.copy2(source, dest_path, follow_symlinks=False)
+			except Exception as err:
+				warn(f'Unable to copy extra path {source} to {dest_path}: {err}')
+
+	def _populate_users_from_skel(self, users: list[User]) -> None:
+		if not users:
+			return
+
+		skel_path = self.target / 'etc' / 'skel'
+		if not skel_path.exists():
+			debug('No /etc/skel present on target, skipping skel population')
+			return
+
+		for user in users:
+			home = self.target / 'home' / user.username
+			if not home.exists():
+				continue
+
+			for root, dirs, files in os.walk(skel_path):
+				root_path = Path(root)
+				for name in dirs + files:
+					src = root_path / name
+					try:
+						rel = src.relative_to(skel_path)
+					except ValueError:
+						continue
+
+					dst = home / rel
+					if dst.exists():
+						continue
+
+					try:
+						if src.is_dir() and not src.is_symlink():
+							dst.mkdir(parents=True, exist_ok=True)
+						else:
+							dst.parent.mkdir(parents=True, exist_ok=True)
+							shutil.copy2(src, dst, follow_symlinks=False)
+					except Exception as err:
+						warn(f'Failed to copy skel entry {src} to {dst}: {err}')
+
+			try:
+				self.arch_chroot(f'chown -R {user.username}:{user.username} /home/{user.username}')
+			except SysCallError as err:
+				warn(f'Failed to update ownership after skel copy for {user.username}: {err}')
+
+	def _install_from_iso_config_path(self, mode: str) -> Path:
+		filename = 'install_from_iso_cache.json' if mode == 'configs_cache' else 'install_from_iso.json'
+		return Path(__file__).resolve().parent.parent / 'config' / filename
+
+	def _default_install_from_iso_config(self, mode: str) -> dict[str, Any]:
+		base = {
+			'root_home': {
+				'include': [
+					'.zshrc',
+					'.bashrc',
+					'.profile',
+					'.zprofile',
+					'.zshenv',
+					'.config/**',
+					'.local/bin/**',
+					'.local/share/applications/**',
+					'.local/share/fonts/**',
+					'.local/share/icons/**',
+					'.local/share/themes/**',
+					'.themes/**',
+					'.icons/**',
+					'.face',
+				],
+				'exclude': [
+					'.cache/**',
+					'.local/state/**',
+					'.local/share/zinit/**',
+					'.local/share/Trash/**',
+					'.local/share/recently-used*',
+					'.local/share/gvfs-metadata/**',
+					'.local/share/flatpak/**',
+					'.local/share/containers/**',
+					'.local/share/keyrings/**',
+					'.zcompdump*',
+					'.dbus/**',
+					'.Xauthority',
+					'.ICEauthority',
+					'.config/pulse/**',
+					'.config/chromium/**',
+					'.config/google-chrome/**',
+					'.config/BraveSoftware/**',
+					'.mozilla/**',
+					'.pki/**',
+					'/run/**',
+					'/tmp/**',
+					'/etc/machine-id',
+					'/var/lib/dbus/machine-id',
+					'/var/lib/systemd/random-seed',
+					'/var/lib/NetworkManager/**',
+					'/var/lib/pacman/local/**',
+				],
+			},
+			'user_home': {
+				'include': [
+					'.zshrc',
+					'.bashrc',
+					'.profile',
+					'.zprofile',
+					'.zshenv',
+					'.config/**',
+					'.local/bin/**',
+					'.local/share/applications/**',
+					'.local/share/fonts/**',
+					'.local/share/icons/**',
+					'.local/share/themes/**',
+					'.themes/**',
+					'.icons/**',
+					'.face',
+				],
+				'exclude': [
+					'.cache/**',
+					'.local/state/**',
+					'.local/share/zinit/**',
+					'.local/share/Trash/**',
+					'.local/share/recently-used*',
+					'.local/share/gvfs-metadata/**',
+					'.local/share/flatpak/**',
+					'.local/share/containers/**',
+					'.local/share/keyrings/**',
+					'.zcompdump*',
+					'.dbus/**',
+					'.Xauthority',
+					'.ICEauthority',
+					'.config/pulse/**',
+					'.config/chromium/**',
+					'.config/google-chrome/**',
+					'.config/BraveSoftware/**',
+					'.mozilla/**',
+					'.pki/**',
+					'/run/**',
+					'/tmp/**',
+					'/etc/machine-id',
+					'/var/lib/dbus/machine-id',
+					'/var/lib/systemd/random-seed',
+					'/var/lib/NetworkManager/**',
+					'/var/lib/pacman/local/**',
+				],
+			},
+			'extra_paths': [{'source': '/etc/skel', 'destination': '/etc/skel'}],
+		}
+
+		if mode == 'configs_cache':
+			# More permissive: include browser and session caches/configs while still skipping machine IDs and known profile managers.
+			cache_exclude = [
+				'.local/share/zinit/**',
+				'.local/share/Trash/**',
+				'.local/share/recently-used*',
+				'.local/share/gvfs-metadata/**',
+				'.zcompdump*',
+				'.dbus/**',
+				'.Xauthority',
+				'.ICEauthority',
+				'/run/**',
+				'/tmp/**',
+				'/etc/machine-id',
+				'/var/lib/dbus/machine-id',
+				'/var/lib/systemd/random-seed',
+				'/var/lib/NetworkManager/**',
+				'/var/lib/pacman/local/**',
+			]
+
+			cache_include = ['*']  # copy everything, let excludes prune machine-specific/stateful bits
+
+			cache_config = {
+				'root_home': {'include': cache_include, 'exclude': cache_exclude},
+				'user_home': {'include': cache_include, 'exclude': cache_exclude},
+				'extra_paths': [{'source': '/etc/skel', 'destination': '/etc/skel'}],
+			}
+			return cache_config
+
+		return base
+
+	def _load_install_from_iso_config(self, mode: str = 'configs') -> dict[str, Any]:
+		cache = self._install_from_iso_config_cache
+
+		if mode in cache:
+			return cache[mode]
+
+		default = self._default_install_from_iso_config(mode)
+		path = self._install_from_iso_config_path(mode)
+
+		if not path.exists():
+			cache[mode] = default
+			return default
+
+		try:
+			cfg = json.loads(path.read_text())
+			cache[mode] = cfg
+			return cfg
+		except Exception as err:
+			warn(f'Failed to read install_from_iso config for mode {mode}, using defaults: {err}')
+			cache[mode] = default
+			return default
+
+	def _confirm_step(self, choice_key: str, actions: str) -> bool:
+		resp = input(f'Chosen: {choice_key}. {actions}. Continue? (Y/n): ').strip().lower()
+		return resp in ('', 'y', 'yes')
+
+	def _prompt_step_action(self, context: str) -> str | None:
+		options = [
+			('retry', 'Retry the step'),
+			('force', 'Force and continue'),
+			('skip', 'Skip this step and continue'),
+			('stop', 'Stop installation'),
+		]
+
+		print(f'\n{context}')
+		for idx, (_, label) in enumerate(options, 1):
+			print(f'  {idx}) {label}')
+
+		selection = None
+		while selection is None:
+			try:
+				val = input('Select an option (1-4): ').strip()
+				idx = int(val) if val else 0
+				if 1 <= idx <= len(options):
+					selection = options[idx - 1][0]
+				else:
+					print('Invalid selection, try again.')
+			except ValueError:
+				print('Invalid selection, try again.')
+
+		desc = dict(options)[selection]
+		if not self._confirm_step(selection, desc):
+			return None
+
+		if selection == 'stop':
+			raise RequirementError(f'{context} - aborted by user')
+
+		return selection
+
+	def _add_repo_section(self, name: str, body: str) -> None:
+		pacman_conf = self.target / 'etc' / 'pacman.conf'
+		content = pacman_conf.read_text()
+
+		if f'[{name}]' in content:
+			debug(f'Repository {name} already present in pacman.conf')
+			return
+
+		with pacman_conf.open('a') as fp:
+			fp.write(f'\n\n[{name}]\n{body}\n')
+
+	def _repo_exists(self, name: str) -> bool:
+		pacman_conf = self.target / 'etc' / 'pacman.conf'
+		if not pacman_conf.exists():
+			return False
+
+		return f'[{name}]' in pacman_conf.read_text()
+
+	def add_szmelc_repository(self) -> None:
+		body = 'SigLevel = Optional TrustAll\nServer = https://packages.szmelc.com/x86_64'
+		self._add_repo_section('szmelc', body)
+
+	def add_chaotic_aur(self) -> None:
+		if self._repo_exists('chaotic-aur'):
+			debug('Chaotic AUR already configured, syncing package databases')
+			try:
+				self.arch_chroot('pacman -Sy --noconfirm', peek_output=True)
+			except SysCallError as err:
+				if self._silent:
+					raise
+				choice = self._prompt_step_action(f'Chaotic AUR sync failed: {err}')
+				if choice == 'retry':
+					return self.add_chaotic_aur()
+				if choice == 'force':
+					warn('Continuing despite chaotic AUR sync error')
+				elif choice == 'skip':
+					warn('Skipping chaotic AUR sync')
+			return
+
+		chaotic_key = '3056513887B78AEB'
+		chaotic_cdn = 'https://cdn-mirror.chaotic.cx/chaotic-aur'
+
+		steps = [
+			('recv-key', f'pacman-key --recv-key {chaotic_key} --keyserver keyserver.ubuntu.com'),
+			('lsign-key', f'pacman-key --lsign-key {chaotic_key}'),
+			('install-keyring', f"pacman -U '{chaotic_cdn}/chaotic-keyring.pkg.tar.zst' --noconfirm"),
+			('install-mirrorlist', f"pacman -U '{chaotic_cdn}/chaotic-mirrorlist.pkg.tar.zst' --noconfirm"),
+		]
+
+		for key, cmd in steps:
+			while True:
+				try:
+					_ = self.arch_chroot(cmd, peek_output=True)
+					break
+				except SysCallError as err:
+					if self._silent:
+						raise
+					choice = self._prompt_step_action(f'Chaotic AUR step "{key}" failed: {err}')
+					if choice == 'retry':
+						continue
+					if choice == 'force':
+						warn(f'Forcing past chaotic step: {key}')
+						break
+					if choice == 'skip':
+						warn(f'Skipping chaotic step: {key}')
+						break
+					return
+
+		try:
+			self._add_repo_section('chaotic-aur', 'Include = /etc/pacman.d/chaotic-mirrorlist')
+			self.arch_chroot('pacman -Sy --noconfirm', peek_output=True)
+		except SysCallError as err:
+			if self._silent:
+				raise
+			choice = self._prompt_step_action(f'Chaotic AUR repository update failed: {err}')
+			if choice == 'retry':
+				return self.add_chaotic_aur()
+			if choice == 'force':
+				warn('Continuing despite chaotic AUR repo error')
+			elif choice == 'skip':
+				warn('Skipping chaotic AUR repository setup')
+
+	def install_yay(self, users: list[User]) -> None:
+		info('Installing yay from Chaotic AUR repository')
+		# Ensure Chaotic AUR is configured even if the toggle was off.
+		self.add_chaotic_aur()
+
+		while True:
+			try:
+				self.arch_chroot('pacman -Sy --noconfirm', peek_output=True)
+				self.arch_chroot('pacman -S yay --noconfirm --needed', peek_output=True)
+				break
+			except SysCallError as err:
+				if self._silent:
+					raise
+				choice = self._prompt_step_action(f'Installing yay failed: {err}')
+				if choice == 'retry':
+					continue
+				if choice == 'force':
+					warn('Continuing without yay installation')
+					break
+				if choice == 'skip':
+					warn('Skipping yay installation')
+					break
+				return
 
 	def mkinitcpio(self, flags: list[str]) -> bool:
 		for plugin in plugins.values():

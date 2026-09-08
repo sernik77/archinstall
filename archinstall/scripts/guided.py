@@ -1,6 +1,9 @@
 import os
+import re
+import subprocess
 import sys
 import time
+from pathlib import Path
 
 from archinstall.lib.applications.application_handler import ApplicationHandler
 from archinstall.lib.args import ArchConfig, ArchConfigHandler
@@ -9,6 +12,8 @@ from archinstall.lib.bootloader.utils import validate_bootloader_layout
 from archinstall.lib.configuration import confirm_config
 from archinstall.lib.disk.filesystem import FilesystemHandler
 from archinstall.lib.disk.utils import disk_layouts
+from archinstall.lib.entropy import apply_payload, payload_from_config
+from archinstall.lib.exceptions import RequirementError
 from archinstall.lib.general.general_menu import PostInstallationAction, select_post_installation
 from archinstall.lib.global_menu import GlobalMenu
 from archinstall.lib.installer import Installer, accessibility_tools_in_use, run_custom_user_commands
@@ -17,6 +22,7 @@ from archinstall.lib.menu.util import delayed_warning
 from archinstall.lib.mirror.mirror_handler import MirrorListHandler
 from archinstall.lib.models import Bootloader
 from archinstall.lib.models.device import DiskLayoutType, EncryptionType
+from archinstall.lib.models.mirrors import CustomRepository, MirrorConfiguration, SignCheck, SignOption
 from archinstall.lib.models.users import User
 from archinstall.lib.network.network_handler import install_network_config
 from archinstall.lib.packages.util import check_version_upgrade
@@ -24,13 +30,96 @@ from archinstall.lib.profile.profiles_handler import profile_handler
 from archinstall.lib.translationhandler import tr
 from archinstall.tui.components import tui
 
+CUSTOM_SCRIPT_STAGES = [
+	'before_initialization',
+	'after_initialization',
+	'before_user_config',
+	'after_user_config',
+	'before_pre_install',
+	'after_pre_install',
+	'before_installation',
+	'after_installation',
+	'before_post_install',
+	'after_post_install',
+]
+
+
+def _parse_custom_script(script_path: Path) -> dict[str, list[str]]:
+	"""Split custom.sh into per-stage command lists, keyed by leading `# <n>` markers."""
+	stage_cmds: dict[str, list[str]] = {name: [] for name in CUSTOM_SCRIPT_STAGES}
+	stage_map = {idx + 1: name for idx, name in enumerate(CUSTOM_SCRIPT_STAGES)}
+	current_stage: str | None = None
+
+	for raw in script_path.read_text().splitlines():
+		line = raw.rstrip('\n')
+
+		if not line.strip():
+			continue
+
+		if line.startswith('#'):
+			if m := re.match(r'#\s*(\d+)\b', line):
+				current_stage = stage_map.get(int(m.group(1)))
+			continue
+
+		if current_stage is None:
+			continue
+
+		stage_cmds[current_stage].append(line)
+
+	return stage_cmds
+
+
+def run_custom_stage(config: ArchConfig, stage: str) -> None:
+	"""Run the custom.sh commands registered for `stage`, when the feature is enabled."""
+	if not config.custom_script or stage not in CUSTOM_SCRIPT_STAGES:
+		return
+
+	path = Path(__file__).resolve().parent.parent / 'custom.sh'
+	if not path.exists():
+		return
+
+	cmds = _parse_custom_script(path).get(stage, [])
+	if not cmds:
+		return
+
+	env = os.environ.copy()
+	env['stage'] = stage
+
+	info(f'Running custom.sh for stage: {stage}')
+	try:
+		_ = subprocess.run(['/bin/sh', '-c', '\n'.join(cmds)], check=True, env=env)
+	except subprocess.CalledProcessError as err:
+		raise RequirementError(f'custom.sh failed at stage {stage}: {err}') from err
+
+
+def configure_szmelc_repository(config: ArchConfig) -> None:
+	"""Add or remove the Szmelc custom repository according to the config toggle."""
+	if config.mirror_config is None:
+		config.mirror_config = MirrorConfiguration()
+
+	repos = config.mirror_config.custom_repositories
+
+	if not config.szmelc_aur:
+		config.mirror_config.custom_repositories = [repo for repo in repos if repo.name != 'szmelc']
+		return
+
+	if not any(repo.name == 'szmelc' for repo in repos):
+		repos.append(
+			CustomRepository(
+				name='szmelc',
+				url='https://packages.szmelc.com/x86_64',
+				sign_check=SignCheck.Optional,
+				sign_option=SignOption.TrustAll,
+			),
+		)
+
 
 def show_menu(
 	arch_config_handler: ArchConfigHandler,
 	mirror_list_handler: MirrorListHandler,
 ) -> None:
 	upgrade = check_version_upgrade()
-	title_text = 'Archlinux'
+	title_text = 'Entropy Linux'
 
 	if upgrade:
 		text = tr('New version available') + f': {upgrade}'
@@ -76,12 +165,17 @@ def perform_installation(
 	optional_repositories = config.mirror_config.optional_repositories if config.mirror_config else []
 	mountpoint = disk_config.mountpoint if disk_config.mountpoint else mountpoint
 
+	configure_szmelc_repository(config)
+	run_custom_stage(config, 'before_initialization')
+
 	with Installer(
 		mountpoint,
 		disk_config,
 		kernels=config.kernels,
 		silent=arch_config_handler.args.silent,
 	) as installation:
+		run_custom_stage(config, 'after_initialization')
+
 		# Mount all the drives to the desired mountpoint
 		if disk_config.config_type != DiskLayoutType.Pre_mount:
 			installation.mount_ordered_layout()
@@ -100,6 +194,8 @@ def perform_installation(
 		if mirror_config := config.mirror_config:
 			installation.set_mirrors(mirror_list_handler, mirror_config, on_target=False)
 
+		run_custom_stage(config, 'before_pre_install')
+
 		installation.minimal_installation(
 			optional_repositories=optional_repositories,
 			mkinitcpio=run_mkinitcpio,
@@ -110,6 +206,11 @@ def perform_installation(
 
 		if mirror_config := config.mirror_config:
 			installation.set_mirrors(mirror_list_handler, mirror_config, on_target=True)
+
+		run_custom_stage(config, 'after_pre_install')
+
+		if config.chaotic_aur:
+			installation.add_chaotic_aur()
 
 		if config.swap and config.swap.enabled:
 			installation.setup_swap(algo=config.swap.algorithm)
@@ -129,12 +230,24 @@ def perform_installation(
 				config.profile_config,
 			)
 
+		run_custom_stage(config, 'before_user_config')
+
 		users = None
 		if config.auth_config:
 			if config.auth_config.users:
 				users = config.auth_config.users
 				installation.create_users(config.auth_config.users)
 				auth_handler.setup_auth(installation, config.auth_config, config.hostname)
+
+		run_custom_stage(config, 'after_user_config')
+
+		if config.install_from_iso:
+			installation.apply_install_from_iso(users or [], config.install_from_iso_mode)
+
+		run_custom_stage(config, 'before_installation')
+
+		if config.install_yay and users:
+			installation.install_yay(users)
 
 		if app_config := config.app_config:
 			application_handler.install_applications(installation, app_config)
@@ -144,6 +257,10 @@ def perform_installation(
 
 		if config.packages and config.packages[0] != '':
 			installation.add_additional_packages(config.packages)
+
+		entropy_payload = payload_from_config(config)
+		if entropy_payload.include_packages or entropy_payload.configs or entropy_payload.post_commands:
+			apply_payload(installation, entropy_payload)
 
 		if timezone := config.timezone:
 			installation.set_timezone(timezone)
@@ -164,10 +281,14 @@ def perform_installation(
 			if users:
 				profile_config.profile.provision(installation, users)
 
+		run_custom_stage(config, 'after_installation')
+
 		# If the user provided a list of services to be enabled, pass the list to the enable_service function.
 		# Note that while it's called enable_service, it can actually take a list of services and iterate it.
 		if services := config.services:
 			installation.enable_service(services)
+
+		run_custom_stage(config, 'before_post_install')
 
 		if disk_config.has_default_btrfs_vols():
 			btrfs_options = disk_config.btrfs_options
@@ -182,6 +303,8 @@ def perform_installation(
 			run_custom_user_commands(cc, installation)
 
 		installation.genfstab()
+
+		run_custom_stage(config, 'after_post_install')
 
 		debug(f'Disk states after installing:\n{disk_layouts()}')
 

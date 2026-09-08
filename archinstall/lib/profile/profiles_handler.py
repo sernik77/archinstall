@@ -350,6 +350,11 @@ class ProfileHandler:
 				continue
 			profiles += self._process_profile_file(file)
 
+		for profile in list(profiles):
+			for variant in getattr(profile, '_variants', []):
+				if isinstance(variant, Profile):
+					profiles.append(variant)
+
 		self._verify_unique_profile_names(profiles)
 		return profiles
 

@@ -94,6 +94,17 @@ class ArchConfigType(StrEnum):
 	PACKAGES = auto()
 	PACMAN_CONFIG = auto()
 	CUSTOM_COMMANDS = auto()
+	# szmelcinstall / Entropy Linux additions
+	INSTALL_FROM_ISO = auto()
+	INSTALL_FROM_ISO_MODE = auto()
+	CUSTOM_SCRIPT = auto()
+	SZMELC_AUR = auto()
+	INSTALL_YAY = auto()
+	CHAOTIC_AUR = auto()
+	ENTROPY_KITS = auto()
+	ENTROPY_CONFIG_PACKS = auto()
+	ENTROPY_ASSET_PACKS = auto()
+	ENTROPY_SZMELC_PACKAGES = auto()
 
 	def text(self) -> str:
 		match self:
@@ -143,6 +154,26 @@ class ArchConfigType(StrEnum):
 				return tr('Root encrypted password')
 			case ArchConfigType.ENCRYPTION_PASSWORD:
 				return tr('Disk encryption password')
+			case ArchConfigType.INSTALL_FROM_ISO:
+				return tr('Install from ISO')
+			case ArchConfigType.INSTALL_FROM_ISO_MODE:
+				return tr('Install from ISO mode')
+			case ArchConfigType.CUSTOM_SCRIPT:
+				return tr('Custom script (custom.sh)')
+			case ArchConfigType.SZMELC_AUR:
+				return tr('Szmelc AUR')
+			case ArchConfigType.INSTALL_YAY:
+				return tr('Install yay')
+			case ArchConfigType.CHAOTIC_AUR:
+				return tr('Chaotic AUR')
+			case ArchConfigType.ENTROPY_KITS:
+				return tr('Entropy kits')
+			case ArchConfigType.ENTROPY_CONFIG_PACKS:
+				return tr('Szmelc configs')
+			case ArchConfigType.ENTROPY_ASSET_PACKS:
+				return tr('Szmelc assets')
+			case ArchConfigType.ENTROPY_SZMELC_PACKAGES:
+				return tr('Szmelc packages')
 
 
 USER_CONFIG_FILE: Path = Path('user_configuration.json')
@@ -164,7 +195,7 @@ class ArchConfig:
 	app_config: ApplicationConfiguration | None = None
 	auth_config: AuthenticationConfiguration | None = None
 	swap: ZramConfiguration | None = None
-	hostname: str = 'archlinux'
+	hostname: str = 'entropy'
 	kernels: list[str] = field(default_factory=lambda: [DEFAULT_KERNEL.value])
 	ntp: bool = True
 	packages: list[str] = field(default_factory=list)
@@ -172,6 +203,17 @@ class ArchConfig:
 	timezone: str = 'UTC'
 	services: list[str] = field(default_factory=list)
 	custom_commands: list[str] = field(default_factory=list)
+	# szmelcinstall / Entropy Linux additions
+	install_from_iso: bool = False
+	install_from_iso_mode: str = 'configs'
+	custom_script: bool = False
+	szmelc_aur: bool = True
+	install_yay: bool = True
+	chaotic_aur: bool = True
+	entropy_kits: list[str] = field(default_factory=list)
+	entropy_config_packs: list[str] = field(default_factory=list)
+	entropy_asset_packs: list[str] = field(default_factory=list)
+	entropy_szmelc_packages: list[str] = field(default_factory=list)
 
 	def unsafe_config(self) -> dict[ArchConfigType, Any]:
 		config: dict[ArchConfigType, list[UserSerialization] | str | None] = {}
@@ -216,6 +258,16 @@ class ArchConfig:
 			ArchConfigType.SERVICES: self.services,
 			ArchConfigType.PACKAGES: self.packages,
 			ArchConfigType.CUSTOM_COMMANDS: self.custom_commands,
+			ArchConfigType.INSTALL_FROM_ISO: self.install_from_iso,
+			ArchConfigType.INSTALL_FROM_ISO_MODE: self.install_from_iso_mode,
+			ArchConfigType.CUSTOM_SCRIPT: self.custom_script,
+			ArchConfigType.SZMELC_AUR: self.szmelc_aur,
+			ArchConfigType.INSTALL_YAY: self.install_yay,
+			ArchConfigType.CHAOTIC_AUR: self.chaotic_aur,
+			ArchConfigType.ENTROPY_KITS: self.entropy_kits,
+			ArchConfigType.ENTROPY_CONFIG_PACKS: self.entropy_config_packs,
+			ArchConfigType.ENTROPY_ASSET_PACKS: self.entropy_asset_packs,
+			ArchConfigType.ENTROPY_SZMELC_PACKAGES: self.entropy_szmelc_packages,
 		}
 
 	def sub_cfg(self) -> dict[ArchConfigType, SubConfig]:
@@ -251,6 +303,38 @@ class ArchConfig:
 			cfg[ArchConfigType.APP_CONFIG] = self.app_config
 
 		return cfg
+
+	def _parse_szmelc_args(self, args_config: dict[str, Any]) -> None:
+		"""Parse the szmelcinstall / Entropy Linux specific configuration keys."""
+		if 'install_from_iso' in args_config:
+			self.install_from_iso = bool(args_config['install_from_iso'])
+
+		if 'install_from_iso_mode' in args_config:
+			self.install_from_iso_mode = str(args_config['install_from_iso_mode'])
+
+		if 'custom_script' in args_config:
+			self.custom_script = bool(args_config['custom_script'])
+
+		if 'szmelc_aur' in args_config:
+			self.szmelc_aur = bool(args_config['szmelc_aur'])
+
+		if 'install_yay' in args_config:
+			self.install_yay = bool(args_config['install_yay'])
+
+		if 'chaotic_aur' in args_config:
+			self.chaotic_aur = bool(args_config['chaotic_aur'])
+
+		if 'entropy_kits' in args_config:
+			self.entropy_kits = list(args_config['entropy_kits'])
+
+		if 'entropy_config_packs' in args_config:
+			self.entropy_config_packs = list(args_config['entropy_config_packs'])
+
+		if 'entropy_asset_packs' in args_config:
+			self.entropy_asset_packs = list(args_config['entropy_asset_packs'])
+
+		if 'entropy_szmelc_packages' in args_config:
+			self.entropy_szmelc_packages = list(args_config['entropy_szmelc_packages'])
 
 	@classmethod
 	def from_config(cls, args_config: dict[str, Any], args: Arguments) -> Self:
@@ -374,6 +458,8 @@ class ArchConfig:
 
 		if custom_commands := args_config.get('custom_commands', []):
 			arch_config.custom_commands = custom_commands
+
+		arch_config._parse_szmelc_args(args_config)
 
 		return arch_config
 
@@ -506,7 +592,10 @@ class ArchConfigHandler:
 		_ = subparsers.add_parser(SubCommand.SHARE_LOG.value, help='Upload log file to public server')
 
 	def _define_arguments(self) -> ArgumentParser:
-		parser = ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+		parser = ArgumentParser(
+			formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+			description='szmelcinstall (Entropy Linux installer) - fork of archinstall',
+		)
 
 		parser.add_argument(
 			'-v',
