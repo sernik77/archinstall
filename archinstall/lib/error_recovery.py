@@ -159,6 +159,11 @@ def open_shell(hint: str = '') -> None:
 	print()
 
 
+def ask_text(question: str, timeout: float = DEFAULT_TIMEOUT) -> str:
+	"""Ask for a free-form answer. Returns an empty string on a timeout or on EOF."""
+	return _read_line(question, timeout) or ''
+
+
 def confirm(question: str, default: bool) -> bool:
 	"""Ask a yes/no question. An empty answer, a timeout or EOF selects ``default``."""
 	answer = _read_line(f'{question} {"(Y/n)" if default else "(y/N)"}: ', DEFAULT_TIMEOUT)

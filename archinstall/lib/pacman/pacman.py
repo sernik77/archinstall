@@ -5,7 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from archinstall.lib.command import SysCommand
-from archinstall.lib.error_recovery import RETRY, Recovery, package, prompt
+from archinstall.lib.error_recovery import RETRY, Recovery, ask_text, package, prompt
 from archinstall.lib.exceptions import RequirementError, SysCallError
 from archinstall.lib.log import debug, error, info, warn
 from archinstall.lib.pacman.errors import Failure, FailureKind, classify, strip_version
@@ -235,12 +235,10 @@ class Pacman:
 		packages[:] = kept
 
 	def _rename(self, packages: list[str], name: str) -> None:
-		try:
-			replacement = input(f'Enter the package name to use instead of {name}: ').strip()
-		except EOFError:
-			replacement = ''
+		replacement = ask_text(f'Enter the package name to use instead of {name}: ')
 
 		if not replacement:
+			warn(f'No replacement given, keeping {name}')
 			return
 
 		target = strip_version(name)

@@ -101,3 +101,30 @@ def test_declining_to_resume_shows_the_choices_again(monkeypatch: pytest.MonkeyP
 def test_a_safe_option_that_is_not_offered_is_a_programming_error() -> None:
 	with pytest.raises(ValueError, match='not among the offered choices'):
 		prompt('Package conflict', OPTIONS, safe='nonexistent')
+
+
+def test_a_deliberate_exit_is_not_reported_as_a_crash(capsys: pytest.CaptureFixture[str]) -> None:
+	"""
+	The abort travels out through `with Installer(...)`. Choosing to stop is a
+	decision, so it must not print the "please file a bug" banner.
+	"""
+	from archinstall.lib.installer import Installer
+
+	installer = Installer.__new__(Installer)
+	installer._helper_flags = {}
+
+	propagated = installer.__exit__(InstallationAborted, InstallationAborted('Package conflict'), None)
+
+	assert propagated is None, 'the abort has to reach main() to be reported there'
+	assert 'submit this issue' not in capsys.readouterr().out
+
+
+def test_a_genuine_failure_still_asks_for_a_bug_report(capsys: pytest.CaptureFixture[str]) -> None:
+	from archinstall.lib.installer import Installer
+
+	installer = Installer.__new__(Installer)
+	installer._helper_flags = {}
+
+	installer.__exit__(RuntimeError, RuntimeError('boom'), None)
+
+	assert 'submit this issue' in capsys.readouterr().out

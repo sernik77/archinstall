@@ -28,7 +28,7 @@ from archinstall.lib.disk.utils import (
 	mount,
 	swapon,
 )
-from archinstall.lib.error_recovery import report_dropped
+from archinstall.lib.error_recovery import InstallationAborted, report_dropped
 from archinstall.lib.exceptions import DiskError, HardwareIncompatibilityError, RequirementError, ServiceException, SysCallError
 from archinstall.lib.hardware import SysInfo
 from archinstall.lib.linux_path import LPath
@@ -146,6 +146,12 @@ class Installer:
 
 	def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None) -> bool | None:
 		if exc_type is not None:
+			if issubclass(exc_type, InstallationAborted):
+				# The user asked to stop from a recovery prompt. That is a choice,
+				# not a crash, so skip the bug report banner; main() reports it.
+				self.sync_log_to_install_medium()
+				return None
+
 			error(str(exc_value))
 
 			self.sync_log_to_install_medium()
