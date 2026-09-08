@@ -214,6 +214,11 @@ class ArchConfig:
 	entropy_config_packs: list[str] = field(default_factory=list)
 	entropy_asset_packs: list[str] = field(default_factory=list)
 	entropy_szmelc_packages: list[str] = field(default_factory=list)
+	# Navigation placeholders for the Entropy/Arch tweak submenus. They hold no
+	# configuration of their own, but AbstractMenu._sync_from_config() looks up
+	# every keyed MenuItem on the config, so the attributes have to exist.
+	entropy_tweaks: bool | None = None
+	arch_tweaks: bool | None = None
 
 	def unsafe_config(self) -> dict[ArchConfigType, Any]:
 		config: dict[ArchConfigType, list[UserSerialization] | str | None] = {}
