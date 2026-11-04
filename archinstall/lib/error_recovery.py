@@ -37,7 +37,7 @@ _EXIT = '__exit__'
 _VERSIONED = re.compile(r'(?P<name>[^<>=]+)(?P<version>[<>=].*)$')
 
 
-class InstallationAborted(Exception):
+class InstallationAbortedError(Exception):
 	"""Raised when the user chooses to stop the installation from a recovery prompt."""
 
 	def __init__(self, reason: str, save_config: bool = False) -> None:
@@ -90,19 +90,20 @@ def prompt(
 	instead of guessing.
 
 	Returns one of the caller's keys or :data:`RETRY`, and raises
-	:class:`InstallationAborted` if the user asks to stop.
+	:class:`InstallationAbortedError` if the user asks to stop.
 	"""
 	if safe is not None and all(option.key != safe for option in options):
 		raise ValueError(f'Safe option {safe!r} is not among the offered choices')
 
-	choices = options + [
+	choices = [
+		*options,
 		Recovery(_MANUAL, 'Resolve manually in a shell'),
 		Recovery(_EXIT, 'Exit the installation'),
 	]
 
 	if not interactive or not _can_prompt():
 		if safe is None:
-			raise InstallationAborted(header)
+			raise InstallationAbortedError(header)
 
 		debug(f'Not interactive, recovering from "{header}" with the safe option: {safe}')
 		return safe
@@ -115,7 +116,7 @@ def prompt(
 		if answer is None:
 			# Timed out, or stdin went away and we can no longer ask anything.
 			if safe is None:
-				raise InstallationAborted(header)
+				raise InstallationAbortedError(header)
 
 			warn(f'No answer within {int(timeout)}s, continuing with the safe option')
 			return safe
@@ -133,7 +134,7 @@ def prompt(
 				return RETRY
 		elif key == _EXIT:
 			save = confirm('Save the installation configuration before exiting?', default=False)
-			raise InstallationAborted(header, save_config=save)
+			raise InstallationAbortedError(header, save_config=save)
 		else:
 			return key
 

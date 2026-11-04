@@ -1,6 +1,6 @@
 # Maintainer: sx66 <serainox@gmail.com>
 # For Entropy Linux
-# Forked from upstream archinstall PKGBUILD (rebased onto archinstall 4.4)
+# Forked from upstream archinstall PKGBUILD (rebased onto archinstall 4.5)
 
 pkgname=archinstall-entropy
 pkgver=13

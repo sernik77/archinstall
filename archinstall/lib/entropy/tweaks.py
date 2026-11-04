@@ -21,7 +21,7 @@ class EntropyTweaksMenu(AbstractSubMenu[None]):
 		'configs_cache': tr('Configs + Live Cache'),
 	}
 
-	def __init__(self, config: ArchConfig):
+	def __init__(self, config: ArchConfig) -> None:
 		self._config = config
 
 		async def _select_install_from_iso_mode(current: str | None) -> str | None:
@@ -116,7 +116,7 @@ class EntropyTweaksMenu(AbstractSubMenu[None]):
 
 
 class ArchTweaksMenu(AbstractSubMenu[None]):
-	def __init__(self, config: ArchConfig):
+	def __init__(self, config: ArchConfig) -> None:
 		self._config = config
 		items = [
 			MenuItem(

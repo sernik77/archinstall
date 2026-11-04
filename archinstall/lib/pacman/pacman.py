@@ -3,6 +3,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from archinstall.lib.command import SysCommand
 from archinstall.lib.error_recovery import RETRY, Recovery, ask_text, package, prompt
@@ -24,7 +25,7 @@ _HEADERS = {
 
 
 class Pacman:
-	def __init__(self, target: Path, silent: bool = False):
+	def __init__(self, target: Path, silent: bool = False) -> None:
 		self.synced = False
 		self.silent = silent
 		self.target = target
@@ -59,7 +60,7 @@ class Pacman:
 				error(tr('Pre-existing pacman lock never exited. Please clean up any existing pacman sessions before using archinstall.'))
 				sys.exit(1)
 
-	def ask(self, error_message: str, bail_message: str, func: Callable, *args, **kwargs) -> None:  # type: ignore[no-untyped-def, type-arg]
+	def ask(self, error_message: str, bail_message: str, func: Callable, *args: Any, **kwargs: Any) -> None:  # type: ignore[type-arg]
 		while True:
 			try:
 				func(*args, **kwargs)

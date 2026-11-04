@@ -1,7 +1,7 @@
 import pytest
 
 from archinstall.lib import error_recovery
-from archinstall.lib.error_recovery import RETRY, InstallationAborted, Recovery, prompt
+from archinstall.lib.error_recovery import RETRY, InstallationAbortedError, Recovery, prompt
 
 OPTIONS = [
 	Recovery('keep_first', 'Keep the first one'),
@@ -18,7 +18,7 @@ def _interactive(monkeypatch: pytest.MonkeyPatch) -> None:
 def _answers(monkeypatch: pytest.MonkeyPatch, *lines: str | None) -> None:
 	remaining = list(lines)
 
-	def read_line(question: str, timeout: float | None) -> str | None:
+	def read_line(_question: str, _timeout: float | None) -> str | None:
 		return remaining.pop(0)
 
 	monkeypatch.setattr(error_recovery, '_read_line', read_line)
@@ -46,12 +46,12 @@ def test_no_answer_and_no_safe_option_aborts(monkeypatch: pytest.MonkeyPatch) ->
 	"""Without a safe choice the prompt waits, so a None here means stdin is gone."""
 	_answers(monkeypatch, None)
 
-	with pytest.raises(InstallationAborted):
+	with pytest.raises(InstallationAbortedError):
 		prompt('Package conflict', OPTIONS, safe=None)
 
 
 def test_unattended_runs_take_the_safe_option_without_asking(monkeypatch: pytest.MonkeyPatch) -> None:
-	def unreachable(question: str, timeout: float | None) -> str | None:
+	def unreachable(_question: str, _timeout: float | None) -> str | None:
 		raise AssertionError('should not have prompted')
 
 	monkeypatch.setattr(error_recovery, '_read_line', unreachable)
@@ -59,8 +59,8 @@ def test_unattended_runs_take_the_safe_option_without_asking(monkeypatch: pytest
 	assert prompt('Package conflict', OPTIONS, safe='drop', interactive=False) == 'drop'
 
 
-def test_unattended_runs_abort_when_nothing_is_safe(monkeypatch: pytest.MonkeyPatch) -> None:
-	with pytest.raises(InstallationAborted):
+def test_unattended_runs_abort_when_nothing_is_safe() -> None:
+	with pytest.raises(InstallationAbortedError):
 		prompt('Package conflict', OPTIONS, safe=None, interactive=False)
 
 
@@ -68,7 +68,7 @@ def test_the_escape_hatches_are_always_appended(monkeypatch: pytest.MonkeyPatch)
 	"""Two caller options means 3 is the shell and 4 is exit."""
 	_answers(monkeypatch, '4', 'n')
 
-	with pytest.raises(InstallationAborted) as raised:
+	with pytest.raises(InstallationAbortedError) as raised:
 		prompt('Package conflict', OPTIONS, safe='drop')
 
 	assert raised.value.save_config is False
@@ -77,7 +77,7 @@ def test_the_escape_hatches_are_always_appended(monkeypatch: pytest.MonkeyPatch)
 def test_exiting_can_request_the_configuration_to_be_saved(monkeypatch: pytest.MonkeyPatch) -> None:
 	_answers(monkeypatch, '4', 'y')
 
-	with pytest.raises(InstallationAborted) as raised:
+	with pytest.raises(InstallationAbortedError) as raised:
 		prompt('Package conflict', OPTIONS, safe='drop')
 
 	assert raised.value.save_config is True
@@ -85,14 +85,14 @@ def test_exiting_can_request_the_configuration_to_be_saved(monkeypatch: pytest.M
 
 
 def test_resolving_manually_and_resuming_retries_the_operation(monkeypatch: pytest.MonkeyPatch) -> None:
-	monkeypatch.setattr(error_recovery, 'open_shell', lambda hint='': None)
+	monkeypatch.setattr(error_recovery, 'open_shell', lambda _hint='': None)
 	_answers(monkeypatch, '3', 'y')
 
 	assert prompt('Package conflict', OPTIONS, safe='drop') == RETRY
 
 
 def test_declining_to_resume_shows_the_choices_again(monkeypatch: pytest.MonkeyPatch) -> None:
-	monkeypatch.setattr(error_recovery, 'open_shell', lambda hint='': None)
+	monkeypatch.setattr(error_recovery, 'open_shell', lambda _hint='': None)
 	_answers(monkeypatch, '3', 'n', '2')
 
 	assert prompt('Package conflict', OPTIONS, safe='drop') == 'drop'
@@ -113,7 +113,7 @@ def test_a_deliberate_exit_is_not_reported_as_a_crash(capsys: pytest.CaptureFixt
 	installer = Installer.__new__(Installer)
 	installer._helper_flags = {}
 
-	propagated = installer.__exit__(InstallationAborted, InstallationAborted('Package conflict'), None)
+	propagated = installer.__exit__(InstallationAbortedError, InstallationAbortedError('Package conflict'), None)
 
 	assert propagated is None, 'the abort has to reach main() to be reported there'
 	assert 'submit this issue' not in capsys.readouterr().out

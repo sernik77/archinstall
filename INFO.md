@@ -2,7 +2,7 @@ Entropy Linux Installer (szmelcinstall)
 
 This installer is an Entropy-focused fork of archinstall.
 
-Based on upstream archinstall 4.4 (Textual TUI).
+Based on upstream archinstall 4.5 (Textual TUI).
 
 Controls:
 - F1: help panel (key bindings)

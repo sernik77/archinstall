@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 
 class EntropyProfileVariant(Profile):
-	def __init__(self, component: EntropyComponent):
+	def __init__(self, component: EntropyComponent) -> None:
 		super().__init__(
 			component.name,
 			ProfileType.EntropyVariant,

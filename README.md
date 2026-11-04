@@ -1,7 +1,7 @@
 # SzmelcInstall
 > ### *Archinstall fork for Entropy Linux*
 > ## Version: 13
-> Rebased onto upstream **archinstall 4.4** (Textual TUI).
+> Rebased onto upstream **archinstall 4.5** (Textual TUI).
 
 ---
 
@@ -27,7 +27,7 @@
 - Install-from-ISO with two modes: **Configs** (safe, curated includes/excludes) or **Configs + Live Cache** (bring almost everything from the live session). Configs live in `config/install_from_iso.json` and `config/install_from_iso_cache.json`. Both modes copy dotfiles, themes/icons/fonts, `/etc/skel`, and reinstall the live ISO package set while skipping machine IDs and other bad state.
 - Entropy Tweaks: Install-from-ISO mode selector and Szmelc AUR repo toggle (Optional/TrustAll, `packages.szmelc.com`).
 - Custom script hook (toggle in Entropy Tweaks): runs `custom.sh` stages before/after major steps. Edit `archinstall/custom.sh` to add per-stage commands; missing or commented stages are skipped.
-- Entropy profile family (Baseline, Server, Desktop PRO/LITE) with JSON metadata in `config/entropy/profiles` and runner `default_profiles/entropy-profiles.py`.
+- Entropy profile family (Baseline, Server, Desktop PRO/LITE) with JSON metadata in `config/entropy/profiles` and runner `default_profiles/entropy_profiles.py`.
 - JSON-driven Entropy kits, Szmelc config packs, asset packs, and Szmelc package picker under Entropy Tweaks (merges include/exclude packages, config copies, and post-commands).
 - Arch Tweaks: yay (from Chaotic AUR via pacman) and Chaotic AUR repo setup with interactive retry/force/skip/stop.
 - Halt-and-ask error recovery instead of aborting the install: package conflicts, missing targets, file conflicts and

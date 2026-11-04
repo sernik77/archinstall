@@ -22,7 +22,7 @@ async def _component_menu(
 	items = []
 	for comp in components:
 
-		def _preview(item: MenuItem, c: EntropyComponent = comp) -> str | None:
+		def _preview(_item: MenuItem, c: EntropyComponent = comp) -> str | None:
 			lines = []
 			if c.description:
 				lines.append(c.description)

@@ -172,6 +172,7 @@ def perform_installation(
 		mountpoint,
 		disk_config,
 		kernels=config.kernels,
+		firmware=config.firmware_optdeps,
 		silent=arch_config_handler.args.silent,
 	) as installation:
 		run_custom_stage(config, 'after_initialization')
@@ -181,7 +182,6 @@ def perform_installation(
 			installation.mount_ordered_layout()
 
 		installation.sanity_check(
-			arch_config_handler.args.offline,
 			arch_config_handler.args.skip_ntp,
 			arch_config_handler.args.skip_wkd,
 		)
@@ -316,7 +316,7 @@ def perform_installation(
 				case PostInstallationAction.EXIT:
 					pass
 				case PostInstallationAction.REBOOT:
-					_ = os.system('reboot')  # type: ignore[deprecated]
+					os.system('reboot')
 				case PostInstallationAction.CHROOT:
 					try:
 						installation.drop_to_shell()
@@ -346,10 +346,10 @@ def main(arch_config_handler: ArchConfigHandler | None = None) -> None:
 		arch_config_handler.config.disk_config,
 	):
 		error(failure.description)
-		return
+		return None
 
 	if arch_config_handler.args.dry_run:
-		return
+		return None
 
 	if not arch_config_handler.args.silent:
 		aborted = False
@@ -376,6 +376,8 @@ def main(arch_config_handler: ArchConfigHandler | None = None) -> None:
 		AuthenticationHandler(),
 		ApplicationHandler(),
 	)
+
+	return None
 
 
 if __name__ == '__main__':
